@@ -219,6 +219,7 @@ impl ProcessHandle {
         // (e.g. an SSH-spawned shell) could read /proc/<entrypoint_pid>/environ
         // and recover the gateway-minted JWT. Issue #1354.
         cmd.env_remove(openshell_core::sandbox_env::SANDBOX_TOKEN)
+            .env_remove(openshell_core::sandbox_env::SANDBOX_AUTH_MODE)
             .env_remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE)
             .env_remove(openshell_core::sandbox_env::K8S_SA_TOKEN_FILE);
 
@@ -354,6 +355,7 @@ impl ProcessHandle {
         // (e.g. an SSH-spawned shell) could read /proc/<entrypoint_pid>/environ
         // and recover the gateway-minted JWT. Issue #1354.
         cmd.env_remove(openshell_core::sandbox_env::SANDBOX_TOKEN)
+            .env_remove(openshell_core::sandbox_env::SANDBOX_AUTH_MODE)
             .env_remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE)
             .env_remove(openshell_core::sandbox_env::K8S_SA_TOKEN_FILE);
 
