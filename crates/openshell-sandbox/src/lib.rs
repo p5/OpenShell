@@ -9,6 +9,7 @@ pub mod bypass_monitor;
 mod child_env;
 pub mod debug_rpc;
 pub mod denial_aggregator;
+mod gcp_metadata;
 mod grpc_client;
 mod identity;
 pub mod l7;
@@ -404,7 +405,7 @@ pub async fn run_sandbox(
         provider_env,
         provider_credential_expires_at_ms,
     );
-    let provider_env = provider_credentials.snapshot().child_env.clone();
+    let provider_env = provider_credentials.child_env_resolved();
 
     // Create identity cache for SHA256 TOFU when OPA is active
     let identity_cache = opa_engine

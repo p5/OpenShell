@@ -14,6 +14,7 @@ pub mod config;
 pub mod driver_utils;
 pub mod error;
 pub mod forward;
+pub mod gcp;
 pub mod gpu;
 pub mod image;
 pub mod inference;

@@ -476,60 +476,94 @@ pub(super) async fn resolve_provider_environment(
             }
         }
 
-        // For Vertex AI providers, inject agent-specific config env vars so that
-        // Claude Code, Goose, and OpenCode inside the sandbox can reach Vertex AI
-        // without additional configuration. Credentials from the loop above take
-        // precedence via entry().or_insert(), and sandbox --env overrides are
-        // applied at the process level after this environment is installed, so
-        // they naturally shadow these values.
-        if openshell_core::inference::normalize_inference_provider_type(&provider.r#type)
-            == Some("google-vertex-ai")
-        {
-            let project_id = provider
-                .config
-                .get(openshell_core::inference::VERTEX_AI_PROJECT_ID_KEY)
-                .map(String::as_str)
-                .unwrap_or_default()
-                .trim();
-            let region = provider
-                .config
-                .get(openshell_core::inference::VERTEX_AI_REGION_KEY)
-                .map(String::as_str)
-                .unwrap_or_default()
-                .trim();
-
-            // Static flags -- always present for Vertex AI providers.
-            env.entry("CLAUDE_CODE_USE_VERTEX".to_string())
-                .or_insert_with(|| "1".to_string());
-            env.entry("GOOSE_PROVIDER".to_string())
-                .or_insert_with(|| "gcp_vertex_ai".to_string());
-
-            // Project ID derived vars.
-            if !project_id.is_empty() {
-                env.entry("ANTHROPIC_VERTEX_PROJECT_ID".to_string())
-                    .or_insert_with(|| project_id.to_string());
-                env.entry("GCP_PROJECT_ID".to_string())
-                    .or_insert_with(|| project_id.to_string());
-                env.entry("GOOGLE_CLOUD_PROJECT".to_string())
-                    .or_insert_with(|| project_id.to_string());
-            }
-
-            // Region derived vars.
-            if !region.is_empty() {
-                env.entry("CLOUD_ML_REGION".to_string())
-                    .or_insert_with(|| region.to_string());
-                env.entry("GCP_LOCATION".to_string())
-                    .or_insert_with(|| region.to_string());
-                env.entry("VERTEX_LOCATION".to_string())
-                    .or_insert_with(|| region.to_string());
-            }
-        }
+        inject_provider_type_env(&provider, &mut env);
     }
 
     Ok(ProviderEnvironment {
         environment: env,
         credential_expires_at_ms: expires,
     })
+}
+
+/// Inject provider-type-specific environment variables into the sandbox.
+///
+/// Handles two GCP provider types:
+/// - `gcp`: metadata emulator for direct GCP SDK access
+/// - `google-vertex-ai`: inference routing via inference.local
+///
+/// Both share common GCP config vars (project ID, region). The `gcp` type
+/// additionally activates the metadata emulator. The `google-vertex-ai` type
+/// additionally injects inference-specific flags.
+fn inject_provider_type_env(
+    provider: &Provider,
+    env: &mut std::collections::HashMap<String, String>,
+) {
+    use openshell_core::gcp;
+
+    let provider_type = provider.r#type.trim().to_ascii_lowercase();
+    let is_gcp = provider_type == "gcp";
+    let is_vertex = openshell_core::inference::normalize_inference_provider_type(&provider.r#type)
+        == Some("google-vertex-ai");
+
+    if !is_gcp && !is_vertex {
+        return;
+    }
+
+    // Common GCP config: project ID and region env vars shared by both types.
+    let project_id_key = if is_gcp {
+        "project_id"
+    } else {
+        openshell_core::inference::VERTEX_AI_PROJECT_ID_KEY
+    };
+    let region_key = if is_gcp {
+        "region"
+    } else {
+        openshell_core::inference::VERTEX_AI_REGION_KEY
+    };
+
+    if let Some(project) = provider.config.get(project_id_key).filter(|v| !v.trim().is_empty()) {
+        for var in gcp::PROJECT_ID_ENV_VARS {
+            env.entry((*var).to_string())
+                .or_insert_with(|| project.trim().to_string());
+        }
+    }
+
+    if let Some(region) = provider.config.get(region_key).filter(|v| !v.trim().is_empty()) {
+        for var in gcp::REGION_ENV_VARS {
+            env.entry((*var).to_string())
+                .or_insert_with(|| region.trim().to_string());
+        }
+    }
+
+    // GCP-only: activate metadata emulator + service account email.
+    if is_gcp {
+        env.entry("GCE_METADATA_HOST".to_string())
+            .or_insert_with(|| gcp::METADATA_HOST.to_string());
+
+        if let Some(email) = provider.config.get("service_account_email") {
+            for var in gcp::SERVICE_ACCOUNT_EMAIL_ENV_VARS {
+                env.entry((*var).to_string())
+                    .or_insert_with(|| email.clone());
+            }
+        }
+    }
+
+    // Vertex-only: inference-specific flags.
+    if is_vertex {
+        env.entry("CLAUDE_CODE_USE_VERTEX".to_string())
+            .or_insert_with(|| "1".to_string());
+        env.entry("GOOSE_PROVIDER".to_string())
+            .or_insert_with(|| "gcp_vertex_ai".to_string());
+
+        if let Some(project) = provider.config.get(project_id_key).filter(|v| !v.trim().is_empty()) {
+            env.entry("ANTHROPIC_VERTEX_PROJECT_ID".to_string())
+                .or_insert_with(|| project.trim().to_string());
+        }
+        if let Some(region) = provider.config.get(region_key).filter(|v| !v.trim().is_empty()) {
+            env.entry("VERTEX_LOCATION".to_string())
+                .or_insert_with(|| region.trim().to_string());
+        }
+    }
 }
 
 pub async fn validate_provider_environment_keys_unique(
@@ -4452,5 +4486,126 @@ mod tests {
             .filter(|i| final_provider.credentials.contains_key(&format!("KEY_{i}")))
             .count();
         assert_eq!(new_keys_count, 1);
+    }
+
+    fn gcp_provider(config: HashMap<String, String>) -> Provider {
+        Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: String::new(),
+                name: "vertex".to_string(),
+                created_at_ms: 0,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            r#type: "gcp".to_string(),
+            credentials: HashMap::new(),
+            config,
+            credential_expires_at_ms: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn inject_gcp_env_sets_metadata_host() {
+        use openshell_core::gcp;
+        let provider = gcp_provider(HashMap::new());
+        let mut env = HashMap::new();
+        inject_provider_type_env(&provider, &mut env);
+        assert_eq!(
+            env.get("GCE_METADATA_HOST").map(String::as_str),
+            Some(gcp::METADATA_HOST),
+        );
+        assert!(
+            !env.contains_key("CLAUDE_CODE_USE_VERTEX"),
+            "CLAUDE_CODE_USE_VERTEX is synthetic, should not be injected here"
+        );
+    }
+
+    #[test]
+    fn inject_gcp_env_propagates_project_id() {
+        use openshell_core::gcp;
+        let provider = gcp_provider(HashMap::from([
+            ("project_id".to_string(), "my-project".to_string()),
+        ]));
+        let mut env = HashMap::new();
+        inject_provider_type_env(&provider, &mut env);
+        for var in gcp::PROJECT_ID_ENV_VARS {
+            assert_eq!(
+                env.get(*var).map(String::as_str),
+                Some("my-project"),
+                "{var} should be set to project_id config value"
+            );
+        }
+    }
+
+    #[test]
+    fn inject_gcp_env_propagates_region() {
+        use openshell_core::gcp;
+        let provider = gcp_provider(HashMap::from([
+            ("region".to_string(), "us-central1".to_string()),
+        ]));
+        let mut env = HashMap::new();
+        inject_provider_type_env(&provider, &mut env);
+        for var in gcp::REGION_ENV_VARS {
+            assert_eq!(
+                env.get(*var).map(String::as_str),
+                Some("us-central1"),
+                "{var} should be set to region config value"
+            );
+        }
+    }
+
+    #[test]
+    fn inject_gcp_env_propagates_service_account_email() {
+        use openshell_core::gcp;
+        let provider = gcp_provider(HashMap::from([
+            ("service_account_email".to_string(), "sa@proj.iam.gserviceaccount.com".to_string()),
+        ]));
+        let mut env = HashMap::new();
+        inject_provider_type_env(&provider, &mut env);
+        for var in gcp::SERVICE_ACCOUNT_EMAIL_ENV_VARS {
+            assert_eq!(
+                env.get(*var).map(String::as_str),
+                Some("sa@proj.iam.gserviceaccount.com"),
+                "{var} should be set to service_account_email config value"
+            );
+        }
+    }
+
+    #[test]
+    fn inject_gcp_env_does_not_overwrite_existing_values() {
+        let provider = gcp_provider(HashMap::from([
+            ("project_id".to_string(), "from-config".to_string()),
+        ]));
+        let mut env = HashMap::from([
+            ("GCP_PROJECT_ID".to_string(), "user-override".to_string()),
+        ]);
+        inject_provider_type_env(&provider, &mut env);
+        assert_eq!(
+            env.get("GCP_PROJECT_ID").map(String::as_str),
+            Some("user-override"),
+            "user-provided value should not be overwritten"
+        );
+    }
+
+    #[test]
+    fn inject_non_gcp_provider_does_nothing() {
+        let provider = Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: String::new(),
+                name: "github".to_string(),
+                created_at_ms: 0,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            r#type: "github".to_string(),
+            credentials: HashMap::new(),
+            config: HashMap::from([
+                ("project_id".to_string(), "should-be-ignored".to_string()),
+            ]),
+            credential_expires_at_ms: HashMap::new(),
+        };
+        let mut env = HashMap::new();
+        inject_provider_type_env(&provider, &mut env);
+        assert!(env.is_empty(), "non-GCP provider should not inject any env vars");
     }
 }

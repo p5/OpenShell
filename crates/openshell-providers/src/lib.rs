@@ -179,6 +179,7 @@ pub fn normalize_provider_type(input: &str) -> Option<&'static str> {
         "codex" => Some("codex"),
         "copilot" => Some("copilot"),
         "opencode" => Some("opencode"),
+        "gcp" | "google-cloud" => Some("gcp"),
         "generic" => Some("generic"),
         "gitlab" | "glab" => Some("gitlab"),
         "github" | "gh" => Some("github"),

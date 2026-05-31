@@ -8,6 +8,8 @@ use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
 use crate::policy::ProxyPolicy;
+use crate::gcp_metadata::MetadataContext;
+use openshell_core::gcp::METADATA_HOST;
 use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
 use crate::provider_credentials::ProviderCredentialState;
 use crate::secrets::{SecretResolver, rewrite_header_line_checked};
@@ -226,6 +228,10 @@ impl ProxyHandle {
             );
         }
 
+        let metadata_ctx: Option<Arc<MetadataContext>> = provider_credentials
+            .as_ref()
+            .map(|creds| Arc::new(MetadataContext::new(creds.clone())));
+
         let join = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
@@ -236,6 +242,7 @@ impl ProxyHandle {
                         let tls = tls_state.clone();
                         let inf = inference_ctx.clone();
                         let policy_local = policy_local_ctx.clone();
+                        let meta = metadata_ctx.clone();
                         let gw = trusted_host_gateway.clone();
                         let resolver = provider_credentials
                             .as_ref()
@@ -250,6 +257,7 @@ impl ProxyHandle {
                                 tls,
                                 inf,
                                 policy_local,
+                                meta,
                                 gw,
                                 resolver,
                                 dtx,
@@ -368,6 +376,7 @@ async fn handle_tcp_connection(
     tls_state: Option<Arc<ProxyTlsState>>,
     inference_ctx: Option<Arc<InferenceContext>>,
     policy_local_ctx: Option<Arc<PolicyLocalContext>>,
+    metadata_ctx: Option<Arc<MetadataContext>>,
     trusted_host_gateway: Arc<Option<IpAddr>>,
     secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
@@ -414,6 +423,7 @@ async fn handle_tcp_connection(
             identity_cache,
             entrypoint_pid,
             policy_local_ctx,
+            metadata_ctx,
             trusted_host_gateway,
             secret_resolver,
             denial_tx.as_ref(),
@@ -447,6 +457,57 @@ async fn handle_tcp_connection(
                 .build();
             ocsf_emit!(event);
         }
+        return Ok(());
+    }
+
+    // GCE metadata emulator — handle CONNECT (Node.js google-auth-library
+    // issues CONNECT to the metadata host during ADC detection).
+    if host_lc == METADATA_HOST {
+        if port != 80 {
+            respond(
+                &mut client,
+                &build_json_error_response(
+                    400,
+                    "Bad Request",
+                    "invalid_metadata_scheme",
+                    "metadata emulator only supports plain HTTP on port 80",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+        respond(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+        if let Some(ctx) = metadata_ctx {
+            let mut buf = vec![0u8; 4096];
+            let mut used = 0;
+            loop {
+                let n = client.read(&mut buf[used..]).await.into_diagnostic()?;
+                if n == 0 {
+                    return Ok(());
+                }
+                used += n;
+                if buf[..used].windows(4).any(|win| win == b"\r\n\r\n") {
+                    break;
+                }
+                if used >= buf.len() {
+                    return Ok(());
+                }
+            }
+            let request = String::from_utf8_lossy(&buf[..used]);
+            let request_line = request.split("\r\n").next().unwrap_or("");
+            let mut parts = request_line.split_whitespace();
+            let method = parts.next().unwrap_or("");
+            let path = parts.next().unwrap_or("/");
+            return crate::gcp_metadata::handle_forward_request(
+                &ctx, method, path, &buf[..used], &mut client,
+            )
+            .await;
+        }
+        respond(
+            &mut client,
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 36\r\n\r\nmetadata emulator is not configured",
+        )
+        .await?;
         return Ok(());
     }
 
@@ -2696,6 +2757,7 @@ async fn handle_forward_proxy(
     identity_cache: Arc<BinaryIdentityCache>,
     entrypoint_pid: Arc<AtomicU32>,
     policy_local_ctx: Option<Arc<PolicyLocalContext>>,
+    metadata_ctx: Option<Arc<MetadataContext>>,
     trusted_host_gateway: Arc<Option<IpAddr>>,
     secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
@@ -2747,6 +2809,38 @@ async fn handle_forward_proxy(
         respond(
             client,
             b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 31\r\n\r\npolicy.local is not configured",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if host_lc == METADATA_HOST {
+        if scheme != "http" || port != 80 {
+            respond(
+                client,
+                &build_json_error_response(
+                    400,
+                    "Bad Request",
+                    "invalid_metadata_scheme",
+                    "Use http://gcp.metadata.openshell.internal only",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+        if let Some(ctx) = metadata_ctx {
+            return crate::gcp_metadata::handle_forward_request(
+                &ctx,
+                method,
+                &path,
+                &buf[..used],
+                client,
+            )
+            .await;
+        }
+        respond(
+            client,
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 36\r\n\r\nmetadata emulator is not configured",
         )
         .await?;
         return Ok(());

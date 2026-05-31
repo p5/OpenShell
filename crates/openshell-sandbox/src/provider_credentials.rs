@@ -74,6 +74,70 @@ impl ProviderCredentialState {
             .clone()
     }
 
+    /// Return child_env with GCP static config vars resolved to real values.
+    ///
+    /// The credential pipeline placeholderizes ALL env values, but GCP SDKs
+    /// and coding agents read certain vars (project ID, region, metadata host)
+    /// at process startup before any HTTP request flows through the proxy.
+    /// This method overrides those vars with resolved real values while
+    /// keeping secret credentials (like `GCP_ACCESS_TOKEN`) as placeholders.
+    ///
+    /// Three layers of env var injection:
+    /// 1. **Synthetic vars** (`GCE_METADATA_IP`, `METADATA_SERVER_DETECTION`)
+    ///    — sandbox-internal config not from user
+    ///    input, inserted directly here with real values.
+    /// 2. **`gcp::STATIC_CONFIG_KEYS`** — user-provided non-secret config
+    ///    (project ID, region, SA email) that was placeholderized by
+    ///    `inject_provider_type_env` → SecretResolver; un-placeholderized
+    ///    here so SDKs can read them at startup.
+    /// 3. Everything else stays as placeholders for proxy-time resolution.
+    pub fn child_env_resolved(&self) -> HashMap<String, String> {
+        use openshell_core::gcp;
+
+        let inner = self
+            .inner
+            .read()
+            .expect("provider credential state poisoned");
+        let mut env = inner.current.child_env.clone();
+
+        if !env.contains_key("GCE_METADATA_HOST") {
+            return env;
+        }
+
+        // Synthetic vars: sandbox-internal config that doesn't originate from
+        // user input and was never placeholderized.
+        env.insert(
+            "GCE_METADATA_HOST".to_string(),
+            gcp::METADATA_HOST.to_string(),
+        );
+        // Python's google-auth uses GCE_METADATA_IP for the initial ping
+        // that detects whether it's running on GCE. Without this, ADC
+        // discovery skips compute engine credentials entirely.
+        env.insert(
+            "GCE_METADATA_IP".to_string(),
+            gcp::METADATA_HOST.to_string(),
+        );
+        // Node.js gcp-metadata uses METADATA_SERVER_DETECTION to skip the
+        // runtime ping that otherwise fails in sandboxed environments.
+        env.insert(
+            "METADATA_SERVER_DETECTION".to_string(),
+            "assume-present".to_string(),
+        );
+
+        // Un-placeholderize non-secret config vars so SDKs can read them
+        // at process startup before any HTTP flows through the proxy.
+        if let Some(ref resolver) = inner.combined_resolver {
+            for key in gcp::STATIC_CONFIG_KEYS {
+                let placeholder = crate::secrets::placeholder_for_env_key(key);
+                if let Some(value) = resolver.resolve_placeholder(&placeholder) {
+                    env.insert(key.to_string(), value.to_string());
+                }
+            }
+        }
+
+        env
+    }
+
     pub fn install_environment(
         &self,
         revision: u64,
@@ -224,6 +288,92 @@ mod tests {
         assert_eq!(
             resolver.resolve_placeholder("openshell:resolve:env:v11_GITHUB_TOKEN"),
             Some("new")
+        );
+    }
+
+    #[test]
+    fn child_env_resolved_without_gcp_returns_unchanged() {
+        let state = ProviderCredentialState::from_environment(
+            1,
+            HashMap::from([("GITHUB_TOKEN".to_string(), "ghp_abc".to_string())]),
+            HashMap::new(),
+        );
+        let env = state.child_env_resolved();
+        assert_eq!(
+            env.get("GITHUB_TOKEN").map(String::as_str),
+            Some("openshell:resolve:env:v1_GITHUB_TOKEN"),
+            "non-GCP env should remain as placeholder"
+        );
+        assert!(!env.contains_key("GCE_METADATA_HOST"));
+        assert!(!env.contains_key("CLAUDE_CODE_USE_VERTEX"));
+    }
+
+    #[test]
+    fn child_env_resolved_overrides_gcp_static_vars() {
+        let state = ProviderCredentialState::from_environment(
+            1,
+            HashMap::from([
+                ("GCE_METADATA_HOST".to_string(), "marker".to_string()),
+                (
+                    "GCP_ADC_ACCESS_TOKEN".to_string(),
+                    "ya29.secret".to_string(),
+                ),
+                ("GCP_PROJECT_ID".to_string(), "my-project".to_string()),
+                ("CLOUD_ML_REGION".to_string(), "us-central1".to_string()),
+            ]),
+            HashMap::new(),
+        );
+        let env = state.child_env_resolved();
+
+        assert_eq!(
+            env.get("GCE_METADATA_HOST").map(String::as_str),
+            Some(openshell_core::gcp::METADATA_HOST),
+            "GCE_METADATA_HOST should be the real hostname"
+        );
+        assert!(
+            !env.contains_key("CLAUDE_CODE_USE_VERTEX"),
+            "inference-specific vars should not be injected"
+        );
+        assert_eq!(
+            env.get("GCP_PROJECT_ID").map(String::as_str),
+            Some("my-project"),
+            "static config should be resolved to real value"
+        );
+        assert_eq!(
+            env.get("CLOUD_ML_REGION").map(String::as_str),
+            Some("us-central1"),
+        );
+
+        let token = env.get("GCP_ADC_ACCESS_TOKEN").map(String::as_str).unwrap();
+        assert!(
+            token.starts_with("openshell:resolve:env:"),
+            "GCP_ACCESS_TOKEN must stay as placeholder, got: {token}"
+        );
+    }
+
+    #[test]
+    fn child_env_resolved_handles_missing_config_keys() {
+        let state = ProviderCredentialState::from_environment(
+            1,
+            HashMap::from([
+                ("GCE_METADATA_HOST".to_string(), "marker".to_string()),
+                ("GCP_ADC_ACCESS_TOKEN".to_string(), "ya29.tok".to_string()),
+            ]),
+            HashMap::new(),
+        );
+        let env = state.child_env_resolved();
+
+        assert_eq!(
+            env.get("GCE_METADATA_HOST").map(String::as_str),
+            Some(openshell_core::gcp::METADATA_HOST),
+        );
+        assert!(
+            !env.contains_key("GCP_PROJECT_ID")
+                || env
+                    .get("GCP_PROJECT_ID")
+                    .unwrap()
+                    .starts_with("openshell:resolve:env:"),
+            "missing config key should not be injected with a real value"
         );
     }
 }

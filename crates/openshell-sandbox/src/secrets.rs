@@ -26,7 +26,7 @@ fn contains_raw_reserved_marker(value: &str) -> bool {
     value.contains(PLACEHOLDER_PREFIX) || value.contains(PROVIDER_ALIAS_MARKER)
 }
 
-fn current_time_ms() -> i64 {
+pub(crate) fn current_time_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
@@ -243,6 +243,15 @@ impl SecretResolver {
                 None
             }
         }
+    }
+
+    /// Return the `expires_at_ms` for a given placeholder, if known.
+    ///
+    /// Returns `Some(0)` when the credential has no configured expiry.
+    pub(crate) fn expires_at_ms_for_placeholder(&self, placeholder: &str) -> Option<i64> {
+        self.by_placeholder
+            .get(placeholder)
+            .map(|s| s.expires_at_ms)
     }
 
     pub(crate) fn rewrite_header_value(
