@@ -71,13 +71,12 @@ pub trait ProviderPlugin: Send + Sync {
         &[]
     }
 
-    /// Apply provider data to sandbox runtime context.
+    /// Inject provider-specific environment variables into the sandbox env.
     ///
-    /// Default implementation is a no-op; provider-specific runtime projection
-    /// can be layered in incrementally.
-    fn apply_to_sandbox(&self, _provider: &Provider) -> Result<(), ProviderError> {
-        Ok(())
-    }
+    /// Called during sandbox creation to project provider config (project IDs,
+    /// regions, SDK flags) into env vars the sandbox process will inherit.
+    /// Default is a no-op; GCP and Vertex providers override this.
+    fn inject_env(&self, _provider: &Provider, _env: &mut HashMap<String, String>) {}
 }
 
 /// Blanket implementation of [`ProviderPlugin`] for [`ProviderDiscoverySpec`].
@@ -116,9 +115,11 @@ impl ProviderRegistry {
         registry.register(providers::openai::SPEC);
         registry.register(providers::anthropic::SPEC);
         registry.register(providers::nvidia::SPEC);
+        registry.register(providers::gcp::GcpPlugin);
         registry.register(providers::gitlab::SPEC);
         registry.register(providers::github::SPEC);
         registry.register(providers::outlook::OutlookProvider);
+        registry.register(providers::vertex::VertexPlugin);
         registry
     }
 
@@ -156,6 +157,20 @@ impl ProviderRegistry {
     #[must_use]
     pub fn profiles(&self) -> Vec<&'static ProviderTypeProfile> {
         default_profiles().iter().collect()
+    }
+
+    /// Inject provider-specific env vars via the registered plugin.
+    ///
+    /// Normalizes the provider type and delegates to the plugin's `inject_env`.
+    /// No-op if the provider type has no registered plugin or the plugin's
+    /// default implementation is a no-op.
+    pub fn inject_env(&self, provider: &Provider, env: &mut HashMap<String, String>) {
+        let normalized = normalize_provider_type(&provider.r#type);
+        if let Some(id) = normalized {
+            if let Some(plugin) = self.get(id) {
+                plugin.inject_env(provider, env);
+            }
+        }
     }
 
     #[must_use]

@@ -4,7 +4,7 @@
 id: gcp
 display_name: Google Cloud (GCP APIs)
 description: Native GCP SDK credentials for sandboxes via metadata emulator
-category: infrastructure
+category: other
 inference_capable: false
 
 credentials:

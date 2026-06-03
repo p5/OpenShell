@@ -88,7 +88,7 @@ impl ProviderCredentialState {
     ///    input, inserted directly here with real values.
     /// 2. **`gcp::STATIC_CONFIG_KEYS`** — user-provided non-secret config
     ///    (project ID, region, SA email) that was placeholderized by
-    ///    `inject_provider_type_env` → SecretResolver; un-placeholderized
+    ///    `ProviderPlugin::inject_env` → SecretResolver; un-placeholderized
     ///    here so SDKs can read them at startup.
     /// 3. Everything else stays as placeholders for proxy-time resolution.
     pub fn child_env_resolved(&self) -> HashMap<String, String> {
@@ -136,6 +136,42 @@ impl ProviderCredentialState {
         }
 
         env
+    }
+
+    /// Return the placeholder for the first available GCP token credential.
+    ///
+    /// Searches `gcp::TOKEN_ENV_KEYS` in priority order (SA before ADC) and
+    /// returns the placeholder string if the credential exists and is not
+    /// expired.
+    pub fn gcp_token_placeholder(&self) -> Option<String> {
+        let resolver = self.resolver()?;
+        for key in openshell_core::gcp::TOKEN_ENV_KEYS {
+            let placeholder = crate::secrets::placeholder_for_env_key(key);
+            if resolver.resolve_placeholder(&placeholder).is_some() {
+                return Some(placeholder);
+            }
+        }
+        None
+    }
+
+    /// Return the remaining lifetime of a GCP token in seconds.
+    ///
+    /// Returns 3600 (one hour) when expiry is unknown or the timestamp is
+    /// non-positive. This matches the default `expires_in` that the real GCE
+    /// metadata server returns.
+    pub fn gcp_token_expires_in(&self, placeholder: &str) -> i64 {
+        const DEFAULT_EXPIRES_IN: i64 = 3600;
+        self.resolver()
+            .and_then(|r| r.expires_at_ms_for_placeholder(placeholder))
+            .map(|expires_at_ms| {
+                if expires_at_ms <= 0 {
+                    DEFAULT_EXPIRES_IN
+                } else {
+                    let now = crate::secrets::current_time_ms();
+                    ((expires_at_ms - now) / 1000).max(0)
+                }
+            })
+            .unwrap_or(DEFAULT_EXPIRES_IN)
     }
 
     pub fn install_environment(
@@ -374,6 +410,90 @@ mod tests {
                     .unwrap()
                     .starts_with("openshell:resolve:env:"),
             "missing config key should not be injected with a real value"
+        );
+    }
+
+    #[test]
+    fn gcp_token_placeholder_returns_sa_over_adc() {
+        let state = ProviderCredentialState::from_environment(
+            1,
+            HashMap::from([
+                ("GCP_SA_ACCESS_TOKEN".to_string(), "sa-tok".to_string()),
+                ("GCP_ADC_ACCESS_TOKEN".to_string(), "adc-tok".to_string()),
+            ]),
+            HashMap::new(),
+        );
+        let placeholder = state.gcp_token_placeholder().expect("should find token");
+        assert!(
+            placeholder.contains("GCP_SA_ACCESS_TOKEN"),
+            "SA token should win over ADC, got: {placeholder}"
+        );
+    }
+
+    #[test]
+    fn gcp_token_placeholder_falls_back_to_adc() {
+        let state = ProviderCredentialState::from_environment(
+            1,
+            HashMap::from([(
+                "GCP_ADC_ACCESS_TOKEN".to_string(),
+                "adc-tok".to_string(),
+            )]),
+            HashMap::new(),
+        );
+        let placeholder = state.gcp_token_placeholder().expect("should find ADC token");
+        assert!(placeholder.contains("GCP_ADC_ACCESS_TOKEN"));
+    }
+
+    #[test]
+    fn gcp_token_placeholder_returns_none_without_gcp() {
+        let state = ProviderCredentialState::from_environment(
+            1,
+            HashMap::from([("GITHUB_TOKEN".to_string(), "ghp_abc".to_string())]),
+            HashMap::new(),
+        );
+        assert!(state.gcp_token_placeholder().is_none());
+    }
+
+    #[test]
+    fn gcp_token_expires_in_defaults_to_3600() {
+        let state = ProviderCredentialState::from_environment(
+            1,
+            HashMap::from([(
+                "GCP_ADC_ACCESS_TOKEN".to_string(),
+                "adc-tok".to_string(),
+            )]),
+            HashMap::new(),
+        );
+        let placeholder = state.gcp_token_placeholder().unwrap();
+        let expires_in = state.gcp_token_expires_in(&placeholder);
+        assert_eq!(expires_in, 3600, "should default to 3600 when no expiry set");
+    }
+
+    #[test]
+    fn gcp_token_expires_in_calculates_remaining() {
+        let now_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        let state = ProviderCredentialState::from_environment(
+            1,
+            HashMap::from([(
+                "GCP_ADC_ACCESS_TOKEN".to_string(),
+                "adc-tok".to_string(),
+            )]),
+            HashMap::from([(
+                "GCP_ADC_ACCESS_TOKEN".to_string(),
+                now_ms + 120_000,
+            )]),
+        );
+        let placeholder = state.gcp_token_placeholder().unwrap();
+        let expires_in = state.gcp_token_expires_in(&placeholder);
+        assert!(
+            (110..=120).contains(&expires_in),
+            "expected ~120s remaining, got {expires_in}"
         );
     }
 }

@@ -31,17 +31,12 @@ const PATH_SCOPES: &str = "/computeMetadata/v1/instance/service-accounts/default
 const PATH_ALIASES: &str = "/computeMetadata/v1/instance/service-accounts/default/aliases";
 const PATH_PROJECT_ID: &str = "/computeMetadata/v1/project/project-id";
 
-/// Token env vars searched in priority order. SA token wins over ADC if both
-/// are configured, matching GCP's own credential precedence.
-const ENV_GCP_TOKEN_KEYS: &[&str] = &["GCP_SA_ACCESS_TOKEN", "GCP_ADC_ACCESS_TOKEN"];
 const ENV_GCP_PROJECT_ID: &str = "GCP_PROJECT_ID";
 const ENV_GCP_SERVICE_ACCOUNT_EMAIL: &str = "GCP_SERVICE_ACCOUNT_EMAIL";
 
 const METADATA_FLAVOR_HEADER: &str = "metadata-flavor";
 const METADATA_FLAVOR_VALUE: &str = "Google";
 const X_FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
-
-const DEFAULT_EXPIRES_IN: i64 = 3600;
 
 #[derive(Debug, Clone)]
 pub struct MetadataContext {
@@ -141,62 +136,28 @@ fn route_request(
     }
 }
 
-/// Find the first available GCP token placeholder from the credential store.
-fn find_token_placeholder(
-    resolver: &secrets::SecretResolver,
-) -> Option<String> {
-    for key in ENV_GCP_TOKEN_KEYS {
-        let placeholder = secrets::placeholder_for_env_key(key);
-        if resolver.resolve_placeholder(&placeholder).is_some() {
-            return Some(placeholder);
-        }
-    }
-    None
-}
-
 fn handle_token(ctx: &MetadataContext) -> MetadataResponse {
-    let Some(resolver) = ctx.credentials.resolver() else {
+    let Some(placeholder) = ctx.credentials.gcp_token_placeholder() else {
+        let has_resolver = ctx.credentials.resolver().is_some();
+        let (msg, error_key) = if has_resolver {
+            ("metadata: no GCP access token available or expired", "token_unavailable")
+        } else {
+            ("metadata: token request but no credentials configured", "credentials_unavailable")
+        };
         emit_metadata_event(
             ActivityId::Fail,
             SeverityId::Medium,
             StatusId::Failure,
-            "metadata: token request but no credentials configured",
+            msg,
         );
         return (
             503,
             "application/json",
-            serde_json::json!({"error": "credentials_unavailable"}).to_string(),
+            serde_json::json!({"error": error_key}).to_string(),
         );
     };
 
-    // Find whichever GCP token is available (SA or ADC flow).
-    // We return the placeholder, not the real token. The proxy resolves it
-    // when the SDK sends it in an Authorization header.
-    let Some(placeholder) = find_token_placeholder(&resolver) else {
-        emit_metadata_event(
-            ActivityId::Fail,
-            SeverityId::Medium,
-            StatusId::Failure,
-            "metadata: no GCP access token available or expired",
-        );
-        return (
-            503,
-            "application/json",
-            serde_json::json!({"error": "token_unavailable"}).to_string(),
-        );
-    };
-
-    let expires_in = resolver
-        .expires_at_ms_for_placeholder(&placeholder)
-        .map(|expires_at_ms| {
-            if expires_at_ms <= 0 {
-                DEFAULT_EXPIRES_IN
-            } else {
-                let now = secrets::current_time_ms();
-                ((expires_at_ms - now) / 1000).max(0)
-            }
-        })
-        .unwrap_or(DEFAULT_EXPIRES_IN);
+    let expires_in = ctx.credentials.gcp_token_expires_in(&placeholder);
 
     emit_metadata_event(
         ActivityId::Open,
