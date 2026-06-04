@@ -38,6 +38,12 @@ Labels follow Kubernetes-style key and value conventions:
 
 Validate labels at API ingress before persisting objects.
 
+## Google Cloud Constants
+
+The `google_cloud` module is the single source of truth for GCP naming: env var
+aliases, provider config keys, token search order, and metadata emulator
+addresses. The sandbox, providers, and server crates import from here.
+
 ## Inference Profiles
 
 Provider inference profiles live in this crate so the gateway, sandbox, and
